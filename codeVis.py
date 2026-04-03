@@ -1,9 +1,8 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from RestrictedPython import compile_restricted, safe_builtins, safe_globals
-from RestrictedPython.Eval import default_guarded_getiter
-from RestrictedPython.Guards import safe_globals as rp_safe_globals, guarded_iter_unpack_sequence
+from RestrictedPython import compile_restricted, safe_builtins
+from RestrictedPython.Guards import guarded_iter_unpack_sequence
 import ast
 import sys
 import json
@@ -73,7 +72,6 @@ def is_data_structure(val):
 
 
 def is_valid_variable(var):
-    # Explicit blocklist — only block known internal names
     internal_names = {
         # RestrictedPython injected names
         "object",
@@ -83,6 +81,7 @@ def is_valid_variable(var):
         "_getitem_",
         "_write_",
         "_inplacevar_",
+        "_iter_unpack_sequence_",
         "__builtins__",
         "__metaclass__",
 
@@ -146,10 +145,12 @@ def make_tracer(execution_log, previous_state, user_code):
             current_line = frame.f_lineno
 
             # Filter 1: Ignore lines beyond user's code length
+            # Prevents RestrictedPython internals leaking in
             if current_line > total_lines:
                 return trace
 
             # Filter 2: Only trace frames from the user's own code
+            # "<user_code>" is the filename set in compile_restricted()
             if frame.f_code.co_filename != "<user_code>":
                 return trace
 
@@ -164,6 +165,9 @@ def make_tracer(execution_log, previous_state, user_code):
                     prev_snap    = previous_state.get(var)
 
                     if var not in previous_state or prev_snap != current_snap:
+                        # Off-by-one fix:
+                        # Tracer fires BEFORE a line runs, so the change
+                        # we see now was caused by the PREVIOUS line
                         reported_line = last_line["value"] if last_line["value"] else current_line
 
                         execution_log.append({
@@ -184,28 +188,44 @@ def make_tracer(execution_log, previous_state, user_code):
 
 # -------------------------------
 # Build Restricted Globals
-# We build this manually instead of using safe_globals.copy()
-# so we have full control over every key — no silent overwrites
+# Built manually for full control — safe_globals.copy() silently
+# ignores additions we make to it so we avoid it entirely
 # -------------------------------
 def build_restricted_globals():
-    # _write_ and _getiter_ are required by RestrictedPython
-    # to handle attribute writes and iteration safely
+
+    # Required by RestrictedPython for attribute/item writes
+    # Called before every ob.attr = x or ob[i] = x
     def _write_(ob):
         return ob
 
+    # FIX: return iter(ob) instead of ob
+    # Required for all for loops — range(), list iteration etc.
+    # Returning ob directly breaks range() iteration
     def _getiter_(ob):
-        return ob
+        return iter(ob)
 
+    # Required for index reads: ob[i]
     def _getitem_(ob, index):
         return ob[index]
 
+    # FIX: Added missing operators **=, //=, &=, |=, ^=
+    # Required for any in-place operation like arr[i] += 1
     def _inplacevar_(op, x, y):
-        if op == "+=":  return x + y
-        if op == "-=":  return x - y
-        if op == "*=":  return x * y
-        if op == "/=":  return x / y
-        if op == "%=":  return x % y
-        raise ValueError(f"Unsupported inplace op: {op}")
+        ops = {
+            "+=":  lambda: x + y,
+            "-=":  lambda: x - y,
+            "*=":  lambda: x * y,
+            "/=":  lambda: x / y,
+            "%=":  lambda: x % y,
+            "**=": lambda: x ** y,
+            "//=": lambda: x // y,
+            "&=":  lambda: x & y,
+            "|=":  lambda: x | y,
+            "^=":  lambda: x ^ y,
+        }
+        if op in ops:
+            return ops[op]()
+        raise ValueError(f"Unsupported inplace operator: {op}")
 
     return {
         # Required Python internals
@@ -216,36 +236,40 @@ def build_restricted_globals():
         "__builtins__":  safe_builtins,
 
         # Required RestrictedPython guard functions
-        "_write_":       _write_,
-        "_getiter_":     _getiter_,
-        "_getitem_":     _getitem_,
-        "_inplacevar_":  _inplacevar_,
+        "_write_":                _write_,
+        "_getiter_":              _getiter_,
+        "_getitem_":              _getitem_,
+        "_inplacevar_":           _inplacevar_,
 
-        # Safe built-in types the user can use
-        "list":          list,
-        "dict":          dict,
-        "set":           set,
-        "tuple":         tuple,
-        "len":           len,
-        "range":         range,
-        "print":         print,
-        "enumerate":     enumerate,
-        "zip":           zip,
-        "map":           map,
-        "filter":        filter,
-        "sorted":        sorted,
-        "reversed":      reversed,
-        "sum":           sum,
-        "min":           min,
-        "max":           max,
-        "abs":           abs,
-        "round":         round,
-        "isinstance":    isinstance,
-        "type":          type,
-        "str":           str,
-        "int":           int,
-        "float":         float,
-        "bool":          bool,
+        # FIX: Required for tuple unpacking swap: a, b = b, a
+        # Without this, bubble sort swap completely fails
+        "_iter_unpack_sequence_": guarded_iter_unpack_sequence,
+
+        # Safe built-in types and functions the user can use
+        "list":       list,
+        "dict":       dict,
+        "set":        set,
+        "tuple":      tuple,
+        "len":        len,
+        "range":      range,
+        "print":      print,
+        "enumerate":  enumerate,
+        "zip":        zip,
+        "map":        map,
+        "filter":     filter,
+        "sorted":     sorted,
+        "reversed":   reversed,
+        "sum":        sum,
+        "min":        min,
+        "max":        max,
+        "abs":        abs,
+        "round":      round,
+        "isinstance": isinstance,
+        "type":       type,
+        "str":        str,
+        "int":        int,
+        "float":      float,
+        "bool":       bool,
     }
 
 
@@ -275,6 +299,7 @@ def analyze_and_execute(code):
         return {"error": f"Restricted Syntax Error: {str(e)}"}
 
     # Step 3: Execute in a thread with 5 second timeout
+    # Using threading instead of signal.SIGALRM — works on Windows + Linux
     restricted_globals = build_restricted_globals()
     execution_result   = {"error": None}
 
