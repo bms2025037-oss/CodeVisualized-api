@@ -1,4 +1,4 @@
-```from fastapi import FastAPI
+from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import ast
@@ -133,4 +133,4 @@ def analyze_and_execute(code):
 # -------------------------------
 @app.post("/run-code")
 def run_code(request: CodeRequest):
-    return analyze_and_execute(request.code)```explain this code trace the entire execution
+    return analyze_and_execute(request.code)
