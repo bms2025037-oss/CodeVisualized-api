@@ -1,28 +1,31 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from RestrictedPython import compile_restricted, safe_globals, safe_builtins
+from RestrictedPython import compile_restricted, safe_builtins, safe_globals
+from RestrictedPython.Eval import default_guarded_getiter
+from RestrictedPython.Guards import safe_globals as rp_safe_globals, guarded_iter_unpack_sequence
 import ast
 import sys
 import json
-import signal
+import threading
 
 app = FastAPI()
 
 # -------------------------------
-# CORS — FIX 1: Removed wildcard + credentials combo
+# CORS
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://code-visualizerbyinnoventures.netlify.app",  # deployed frontend
-        "http://localhost:3000",   # local React dev
-        "http://localhost:5173",   # local Vite dev
+        "https://code-visualizerbyinnoventures.netlify.app",
+        "http://localhost:3000",
+        "http://localhost:5173",
     ],
-    allow_credentials=False,   # No auth/cookies needed, so False is correct
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # -------------------------------
 # Request Model
@@ -32,15 +35,13 @@ class CodeRequest(BaseModel):
 
 
 # -------------------------------
-# STEP 1: Analyze Data Structures (AST)
-# FIX 2: Now detects constructor calls like list(), dict(), set(), tuple()
-# in addition to literals like [], {}, {1,2}, ()
+# AST Analyzer
+# Detects both literals [] and constructors list()
 # -------------------------------
 class DataStructureAnalyzer(ast.NodeVisitor):
     def __init__(self):
         self.structures = set()
 
-    # --- Literal detection (original) ---
     def visit_List(self, node):
         self.structures.add("list")
         self.generic_visit(node)
@@ -57,23 +58,10 @@ class DataStructureAnalyzer(ast.NodeVisitor):
         self.structures.add("tuple")
         self.generic_visit(node)
 
-    # --- FIX 2: Constructor call detection ---
-    # Catches: list(), dict(), set(), tuple(),
-    #          list([1,2]), dict(a=1), set([1,2]), tuple([1,2])
     def visit_Call(self, node):
-        constructor_map = {
-            "list":  "list",
-            "dict":  "dict",
-            "set":   "set",
-            "tuple": "tuple",
-        }
-        # node.func is the function being called
-        # ast.Name covers simple names like list(), dict()
-        if isinstance(node.func, ast.Name):
-            name = node.func.id
-            if name in constructor_map:
-                self.structures.add(constructor_map[name])
-
+        constructors = {"list", "dict", "set", "tuple"}
+        if isinstance(node.func, ast.Name) and node.func.id in constructors:
+            self.structures.add(node.func.id)
         self.generic_visit(node)
 
 
@@ -83,47 +71,88 @@ class DataStructureAnalyzer(ast.NodeVisitor):
 def is_data_structure(val):
     return isinstance(val, (list, dict, set, tuple))
 
-def is_valid_variable(var):
-    return not var.startswith("__") and var != "__builtins__"
 
-# FIX 3: Use json.dumps for fast comparison instead of deepcopy
-# Converts value to a stable string for comparison only
+def is_valid_variable(var):
+    # Explicit blocklist — only block known internal names
+    internal_names = {
+        # RestrictedPython injected names
+        "object",
+        "args",
+        "kwargs",
+        "_getiter_",
+        "_getitem_",
+        "_write_",
+        "_inplacevar_",
+        "__builtins__",
+        "__metaclass__",
+
+        # Python module-level internals
+        "__name__",
+        "__doc__",
+        "__package__",
+        "__loader__",
+        "__spec__",
+        "__file__",
+        "__cached__",
+    }
+
+    if var in internal_names:
+        return False
+
+    # Block single underscore prefix — temp/private vars
+    # Do NOT block double underscore — needed by Python internals
+    if var.startswith("_") and not var.startswith("__"):
+        return False
+
+    return True
+
+
 def make_snapshot(val):
+    """
+    Converts a value to a stable string for fast comparison.
+    Used only for detecting changes — not sent to frontend.
+    """
     try:
-        # sort_keys=True ensures dict comparison is order-independent
-        # e.g. {"b":2,"a":1} == {"a":1,"b":2} will match correctly
         if isinstance(val, set):
-            # sets are unordered — sort them before snapshotting
-            return json.dumps(sorted(list(val), key=str), sort_keys=True)
+            return json.dumps(sorted(list(val), key=str))
         elif isinstance(val, tuple):
             return json.dumps(list(val))
         else:
             return json.dumps(val, sort_keys=True)
     except Exception:
-        # fallback for non-JSON-serializable values
         return repr(val)
 
 
-# -------------------------------
-# Execution Tracer
-# FIX 4: execution_log and previous_state are NO LONGER globals
-#         They are passed in via a closure to avoid race conditions
-#         between concurrent requests
-# FIX 5: Line number off-by-one fixed by tracking the PREVIOUS line
-#         The tracer fires BEFORE a line runs, so when tracer fires
-#         at line N, it means line N-1 just finished and caused the change
-# -------------------------------
-def make_tracer(execution_log, previous_state):
+def serialize_value(val):
     """
-    Returns a tracer function that closes over its own
-    execution_log and previous_state — isolated per request.
+    Converts value to a JSON-safe format for the frontend.
+    Sets and tuples become lists so frontend bar graph can use them directly.
     """
-    # We track the previously seen line number to fix the off-by-one issue
-    last_line = {"value": None}
+    if isinstance(val, (set, tuple)):
+        return list(val)
+    return val
+
+
+# -------------------------------
+# Tracer Factory
+# Returns an isolated tracer per request — no shared global state
+# -------------------------------
+def make_tracer(execution_log, previous_state, user_code):
+    last_line   = {"value": None}
+    total_lines = len(user_code.splitlines())
 
     def trace(frame, event, arg):
         if event == "line":
             current_line = frame.f_lineno
+
+            # Filter 1: Ignore lines beyond user's code length
+            if current_line > total_lines:
+                return trace
+
+            # Filter 2: Only trace frames from the user's own code
+            if frame.f_code.co_filename != "<user_code>":
+                return trace
+
             current_vars = frame.f_locals.copy()
 
             for var, value in current_vars.items():
@@ -135,24 +164,17 @@ def make_tracer(execution_log, previous_state):
                     prev_snap    = previous_state.get(var)
 
                     if var not in previous_state or prev_snap != current_snap:
-                        # FIX 5: Use last_line instead of current_line
-                        # Because: tracer fires BEFORE line runs
-                        # So changes we see now were caused by the PREVIOUS line
                         reported_line = last_line["value"] if last_line["value"] else current_line
 
                         execution_log.append({
                             "line":     reported_line,
                             "variable": var,
                             "type":     type(value).__name__,
-                            # Store real value (not string) so frontend
-                            # can directly use it for bar graph rendering
-                            "value":    list(value) if isinstance(value, (set, tuple)) else value
+                            "value":    serialize_value(value)
                         })
 
-                        # Update snapshot — fast string comparison only
                         previous_state[var] = current_snap
 
-            # Remember current line for next tracer call
             last_line["value"] = current_line
 
         return trace
@@ -161,26 +183,82 @@ def make_tracer(execution_log, previous_state):
 
 
 # -------------------------------
-# Timeout Handler
-# FIX 6: Kills infinite loops — user code is limited to 5 seconds
+# Build Restricted Globals
+# We build this manually instead of using safe_globals.copy()
+# so we have full control over every key — no silent overwrites
 # -------------------------------
-def timeout_handler(signum, frame):
-    raise TimeoutError("Code execution exceeded 5 seconds. Possible infinite loop.")
+def build_restricted_globals():
+    # _write_ and _getiter_ are required by RestrictedPython
+    # to handle attribute writes and iteration safely
+    def _write_(ob):
+        return ob
+
+    def _getiter_(ob):
+        return ob
+
+    def _getitem_(ob, index):
+        return ob[index]
+
+    def _inplacevar_(op, x, y):
+        if op == "+=":  return x + y
+        if op == "-=":  return x - y
+        if op == "*=":  return x * y
+        if op == "/=":  return x / y
+        if op == "%=":  return x % y
+        raise ValueError(f"Unsupported inplace op: {op}")
+
+    return {
+        # Required Python internals
+        "__name__":      "__main__",   # fixes: name '__name__' is not defined
+        "__doc__":       None,
+        "__package__":   None,
+        "__metaclass__": type,         # fixes: NameError on class creation
+        "__builtins__":  safe_builtins,
+
+        # Required RestrictedPython guard functions
+        "_write_":       _write_,
+        "_getiter_":     _getiter_,
+        "_getitem_":     _getitem_,
+        "_inplacevar_":  _inplacevar_,
+
+        # Safe built-in types the user can use
+        "list":          list,
+        "dict":          dict,
+        "set":           set,
+        "tuple":         tuple,
+        "len":           len,
+        "range":         range,
+        "print":         print,
+        "enumerate":     enumerate,
+        "zip":           zip,
+        "map":           map,
+        "filter":        filter,
+        "sorted":        sorted,
+        "reversed":      reversed,
+        "sum":           sum,
+        "min":           min,
+        "max":           max,
+        "abs":           abs,
+        "round":         round,
+        "isinstance":    isinstance,
+        "type":          type,
+        "str":           str,
+        "int":           int,
+        "float":         float,
+        "bool":          bool,
+    }
 
 
 # -------------------------------
-# Core Logic Function
-# FIX 7: execution_log and previous_state are now LOCAL variables
-#         This means each request gets its own isolated state
-#         No more race conditions between concurrent users
+# Core Logic
 # -------------------------------
 def analyze_and_execute(code):
 
-    # FIX 7: Local scope — not shared between requests
+    # Local state per request — no race conditions between concurrent users
     execution_log  = []
     previous_state = {}
 
-    # --- Step 1: Static AST Analysis ---
+    # Step 1: Static AST Analysis
     try:
         tree     = ast.parse(code)
         analyzer = DataStructureAnalyzer()
@@ -190,44 +268,37 @@ def analyze_and_execute(code):
     except Exception as e:
         return {"error": f"Parse Error: {str(e)}"}
 
-    # --- Step 2: Sandbox + Execute ---
+    # Step 2: Compile with RestrictedPython sandbox
     try:
-        # FIX 8: RestrictedPython sandbox
-        # Compiles code in restricted mode — blocks dangerous operations:
-        # - No os, sys, subprocess imports
-        # - No file access
-        # - No __import__ abuse
         byte_code = compile_restricted(code, filename="<user_code>", mode="exec")
+    except SyntaxError as e:
+        return {"error": f"Restricted Syntax Error: {str(e)}"}
 
-        # safe_globals gives a clean, restricted global namespace
-        # We add safe_builtins so basic operations (print, range, len) still work
-        restricted_globals = safe_globals.copy()
-        restricted_globals["__builtins__"] = safe_builtins
+    # Step 3: Execute in a thread with 5 second timeout
+    restricted_globals = build_restricted_globals()
+    execution_result   = {"error": None}
 
-        # FIX 6: Set 5-second timeout before executing
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(5)
+    def run_in_thread():
+        try:
+            tracer = make_tracer(execution_log, previous_state, code)
+            sys.settrace(tracer)
+            exec(byte_code, restricted_globals)
+            sys.settrace(None)
+        except Exception as e:
+            sys.settrace(None)
+            execution_result["error"] = f"Runtime Error: {str(e)}"
 
-        # Install our isolated tracer (FIX 4)
-        tracer = make_tracer(execution_log, previous_state)
-        sys.settrace(tracer)
+    thread = threading.Thread(target=run_in_thread)
+    thread.start()
+    thread.join(timeout=5)
 
-        exec(byte_code, restricted_globals)
+    if thread.is_alive():
+        return {"error": "Code execution exceeded 5 seconds. Possible infinite loop."}
 
-        sys.settrace(None)
-        signal.alarm(0)   # Cancel timeout after successful execution
+    if execution_result["error"]:
+        return {"error": execution_result["error"]}
 
-    except TimeoutError as e:
-        sys.settrace(None)
-        signal.alarm(0)
-        return {"error": str(e)}
-
-    except Exception as e:
-        sys.settrace(None)
-        signal.alarm(0)
-        return {"error": f"Runtime Error: {str(e)}"}
-
-    # --- Step 3: Return results ---
+    # Step 4: Return results
     return {
         "detected_structures": list(analyzer.structures),
         "execution":           execution_log
