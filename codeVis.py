@@ -7,7 +7,6 @@ import ast
 import sys
 import json
 import threading
-import copy
 
 app = FastAPI()
 
@@ -22,6 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # -------------------------------
 # Request Model
 # -------------------------------
@@ -31,6 +31,7 @@ class CodeRequest(BaseModel):
 
 # -------------------------------
 # AST Analyzer
+# Detects both literals [] and constructors list()
 # -------------------------------
 class DataStructureAnalyzer(ast.NodeVisitor):
     def __init__(self):
@@ -68,17 +69,33 @@ def is_data_structure(val):
 
 def is_valid_variable(var):
     internal_names = {
-        "object", "args", "kwargs",
-        "_getiter_", "_getitem_", "_write_", "_inplacevar_",
+        # RestrictedPython injected names
+        "object",
+        "args",
+        "kwargs",
+        "_getiter_",
+        "_getitem_",
+        "_write_",
+        "_inplacevar_",
         "_iter_unpack_sequence_",
-        "__builtins__", "__metaclass__",
-        "__name__", "__doc__", "__package__",
-        "__loader__", "__spec__", "__file__", "__cached__",
+        "__builtins__",
+        "__metaclass__",
+
+        # Python module-level internals
+        "__name__",
+        "__doc__",
+        "__package__",
+        "__loader__",
+        "__spec__",
+        "__file__",
+        "__cached__",
     }
 
     if var in internal_names:
         return False
 
+    # Block single underscore prefix — temp/private vars
+    # Do NOT block double underscore — needed by Python internals
     if var.startswith("_") and not var.startswith("__"):
         return False
 
@@ -86,6 +103,10 @@ def is_valid_variable(var):
 
 
 def make_snapshot(val):
+    """
+    Converts a value to a stable string for fast comparison.
+    Used only for detecting changes — not sent to frontend.
+    """
     try:
         if isinstance(val, set):
             return json.dumps(sorted(list(val), key=str))
@@ -98,25 +119,34 @@ def make_snapshot(val):
 
 
 def serialize_value(val):
+    """
+    Converts value to a JSON-safe format for the frontend.
+    Sets and tuples become lists so frontend bar graph can use them directly.
+    """
     if isinstance(val, (set, tuple)):
         return list(val)
     return val
 
 
 # -------------------------------
-# Tracer (FIXED)
+# Tracer Factory
+# Returns an isolated tracer per request — no shared global state
 # -------------------------------
 def make_tracer(execution_log, previous_state, user_code):
-    last_line = {"value": None}
+    last_line   = {"value": None}
     total_lines = len(user_code.splitlines())
 
     def trace(frame, event, arg):
         if event == "line":
             current_line = frame.f_lineno
 
+            # Filter 1: Ignore lines beyond user's code length
+            # Prevents RestrictedPython internals leaking in
             if current_line > total_lines:
                 return trace
 
+            # Filter 2: Only trace frames from the user's own code
+            # "<user_code>" is the filename set in compile_restricted()
             if frame.f_code.co_filename != "<user_code>":
                 return trace
 
@@ -128,20 +158,19 @@ def make_tracer(execution_log, previous_state, user_code):
 
                 if is_data_structure(value):
                     current_snap = make_snapshot(value)
-                    prev_snap = previous_state.get(var)
+                    prev_snap    = previous_state.get(var)
 
-                    # Initialize once
-                    if var not in previous_state:
-                        previous_state[var] = current_snap
-                        continue
+                    if var not in previous_state or prev_snap != current_snap:
+                        # Off-by-one fix:
+                        # Tracer fires BEFORE a line runs, so the change
+                        # we see now was caused by the PREVIOUS line
+                        reported_line = last_line["value"] if last_line["value"] else current_line
 
-                    # Only log REAL changes
-                    if prev_snap != current_snap:
                         execution_log.append({
-                            "line": current_line,
+                            "line":     reported_line,
                             "variable": var,
-                            "type": type(value).__name__,
-                            "value": copy.deepcopy(serialize_value(value))
+                            "type":     type(value).__name__,
+                            "value":    serialize_value(value)
                         })
 
                         previous_state[var] = current_snap
@@ -154,19 +183,29 @@ def make_tracer(execution_log, previous_state, user_code):
 
 
 # -------------------------------
-# Restricted Globals
+# Build Restricted Globals
+# Built manually for full control — safe_globals.copy() silently
+# ignores additions we make to it so we avoid it entirely
 # -------------------------------
-def build_restricted_globals(output_buffer):
+def build_restricted_globals():
 
+    # Required by RestrictedPython for attribute/item writes
+    # Called before every ob.attr = x or ob[i] = x
     def _write_(ob):
         return ob
 
+    # FIX: return iter(ob) instead of ob
+    # Required for all for loops — range(), list iteration etc.
+    # Returning ob directly breaks range() iteration
     def _getiter_(ob):
         return iter(ob)
 
+    # Required for index reads: ob[i]
     def _getitem_(ob, index):
         return ob[index]
 
+    # FIX: Added missing operators **=, //=, &=, |=, ^=
+    # Required for any in-place operation like arr[i] += 1
     def _inplacevar_(op, x, y):
         ops = {
             "+=":  lambda: x + y,
@@ -182,36 +221,51 @@ def build_restricted_globals(output_buffer):
         }
         if op in ops:
             return ops[op]()
-        raise ValueError(f"Unsupported operator: {op}")
-
-    # ✅ SAFE PRINT
-    def safe_print(*args, **kwargs):
-        output_buffer.append(" ".join(map(str, args)))
+        raise ValueError(f"Unsupported inplace operator: {op}")
 
     return {
-        "__name__": "__main__",
-        "__doc__": None,
-        "__package__": None,
-        "__metaclass__": type,
-        "__builtins__": safe_builtins,
+        # Required Python internals
+        "__name__":      "__main__",   # fixes: name '__name__' is not defined
+        "__doc__":       None,
+        "__package__":   None,
+        "__metaclass__": type,         # fixes: NameError on class creation
+        "__builtins__":  safe_builtins,
 
-        "_write_": _write_,
-        "_getiter_": _getiter_,
-        "_getitem_": _getitem_,
-        "_inplacevar_": _inplacevar_,
+        # Required RestrictedPython guard functions
+        "_write_":                _write_,
+        "_getiter_":              _getiter_,
+        "_getitem_":              _getitem_,
+        "_inplacevar_":           _inplacevar_,
+
+        # FIX: Required for tuple unpacking swap: a, b = b, a
+        # Without this, bubble sort swap completely fails
         "_iter_unpack_sequence_": guarded_iter_unpack_sequence,
 
-        # safe builtins
-        "list": list, "dict": dict, "set": set, "tuple": tuple,
-        "len": len, "range": range, "enumerate": enumerate,
-        "zip": zip, "map": map, "filter": filter,
-        "sorted": sorted, "reversed": reversed,
-        "sum": sum, "min": min, "max": max,
-        "abs": abs, "round": round,
-        "isinstance": isinstance, "type": type,
-        "str": str, "int": int, "float": float, "bool": bool,
-
-        "print": safe_print,  # ✅ FIXED
+        # Safe built-in types and functions the user can use
+        "list":       list,
+        "dict":       dict,
+        "set":        set,
+        "tuple":      tuple,
+        "len":        len,
+        "range":      range,
+        "print":      print,
+        "enumerate":  enumerate,
+        "zip":        zip,
+        "map":        map,
+        "filter":     filter,
+        "sorted":     sorted,
+        "reversed":   reversed,
+        "sum":        sum,
+        "min":        min,
+        "max":        max,
+        "abs":        abs,
+        "round":      round,
+        "isinstance": isinstance,
+        "type":       type,
+        "str":        str,
+        "int":        int,
+        "float":      float,
+        "bool":       bool,
     }
 
 
@@ -220,13 +274,13 @@ def build_restricted_globals(output_buffer):
 # -------------------------------
 def analyze_and_execute(code):
 
-    execution_log = []
+    # Local state per request — no race conditions between concurrent users
+    execution_log  = []
     previous_state = {}
-    output_buffer = []
 
-    # AST
+    # Step 1: Static AST Analysis
     try:
-        tree = ast.parse(code)
+        tree     = ast.parse(code)
         analyzer = DataStructureAnalyzer()
         analyzer.visit(tree)
     except SyntaxError as e:
@@ -234,16 +288,18 @@ def analyze_and_execute(code):
     except Exception as e:
         return {"error": f"Parse Error: {str(e)}"}
 
-    # Compile
+    # Step 2: Compile with RestrictedPython sandbox
     try:
         byte_code = compile_restricted(code, filename="<user_code>", mode="exec")
     except SyntaxError as e:
         return {"error": f"Restricted Syntax Error: {str(e)}"}
 
-    restricted_globals = build_restricted_globals(output_buffer)
-    execution_result = {"error": None}
+    # Step 3: Execute in a thread with 5 second timeout
+    # Using threading instead of signal.SIGALRM — works on Windows + Linux
+    restricted_globals = build_restricted_globals()
+    execution_result   = {"error": None}
 
-    def run():
+    def run_in_thread():
         try:
             tracer = make_tracer(execution_log, previous_state, code)
             sys.settrace(tracer)
@@ -253,25 +309,25 @@ def analyze_and_execute(code):
             sys.settrace(None)
             execution_result["error"] = f"Runtime Error: {str(e)}"
 
-    thread = threading.Thread(target=run)
+    thread = threading.Thread(target=run_in_thread)
     thread.start()
     thread.join(timeout=5)
 
     if thread.is_alive():
-        return {"error": "Execution timeout (possible infinite loop)"}
+        return {"error": "Code execution exceeded 5 seconds. Possible infinite loop."}
 
     if execution_result["error"]:
         return {"error": execution_result["error"]}
 
+    # Step 4: Return results
     return {
         "detected_structures": list(analyzer.structures),
-        "execution": execution_log,
-        "output": output_buffer
+        "execution":           execution_log
     }
 
 
 # -------------------------------
-# API
+# API Endpoint
 # -------------------------------
 @app.post("/run-code")
 def run_code(request: CodeRequest):
