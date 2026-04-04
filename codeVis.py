@@ -8,12 +8,10 @@ import sys
 import json
 import threading
 import copy
+import re
 
 app = FastAPI()
 
-# -------------------------------
-# CORS
-# -------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -26,16 +24,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------------
-# Request Model
-# -------------------------------
 class CodeRequest(BaseModel):
     code: str
 
 
-# -------------------------------
-# AST Analyzer
-# -------------------------------
 class DataStructureAnalyzer(ast.NodeVisitor):
     def __init__(self):
         self.structures = set()
@@ -63,9 +55,6 @@ class DataStructureAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-# -------------------------------
-# Variable Usage Analyzer
-# -------------------------------
 class VariableUsageAnalyzer(ast.NodeVisitor):
     def __init__(self):
         self.usage = {}
@@ -107,14 +96,12 @@ class VariableUsageAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node):
-        # len(arr)
         if isinstance(node.func, ast.Name) and node.func.id == "len":
             if node.args and isinstance(node.args[0], ast.Name):
                 name = node.args[0].id
                 self.ensure_var(name)
                 self.usage[name]["len_used"] += 1
 
-        # arr.append(), arr.pop(), ...
         if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
             name = node.func.value.id
             method = node.func.attr
@@ -136,9 +123,6 @@ class VariableUsageAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-# -------------------------------
-# Helpers
-# -------------------------------
 def is_data_structure(val):
     return isinstance(val, (list, dict, set, tuple))
 
@@ -147,7 +131,7 @@ def is_valid_variable(var):
     internal_names = {
         "object", "args", "kwargs",
         "_getiter_", "_getitem_", "_write_", "_inplacevar_",
-        "_iter_unpack_sequence_",
+        "_iter_unpack_sequence_", "_unpack_sequence_",
         "__builtins__", "__metaclass__",
         "__name__", "__doc__", "__package__",
         "__loader__", "__spec__", "__file__", "__cached__",
@@ -219,13 +203,9 @@ def detect_visual_type(var_name, value, usage_map):
     if list_score > array_score:
         return "list"
 
-    # Default for DSA-style code like sorting/searching
     return "array"
 
 
-# -------------------------------
-# Tracer
-# -------------------------------
 def make_tracer(execution_log, previous_state, user_code, usage_map):
     total_lines = len(user_code.splitlines())
 
@@ -279,12 +259,35 @@ def make_tracer(execution_log, previous_state, user_code, usage_map):
 
     return trace
 
-# -------------------------------
-# Restricted Globals
-# -------------------------------
+
+def rewrite_augmented_subscript(code):
+    """
+    Rewrites augmented assignment on subscripts before restricted compilation.
+    e.g. freq[num] += 1  -->  freq[num] = freq[num] + 1
+    """
+    op_map = {
+        "+=": "+", "-=": "-", "*=": "*", "/=": "/",
+        "%=": "%", "**=": "**", "//=": "//",
+        "&=": "&", "|=": "|", "^=": "^",
+    }
+    pattern = re.compile(
+        r'^(\s*)(\w+)\[([^\]]+)\]\s*(\*\*=|//=|[+\-*/%&|^]=)\s*(.+)$',
+        re.MULTILINE
+    )
+
+    def replacer(match):
+        indent, var, key, op, value = match.groups()
+        plain_op = op_map[op]
+        return f"{indent}{var}[{key}] = {var}[{key}] {plain_op} {value}"
+
+    return pattern.sub(replacer, code)
+
+
 def build_restricted_globals(output_buffer):
 
     def _write_(ob):
+        if isinstance(ob, (list, dict, set)):
+            return ob
         return ob
 
     def _getiter_(ob):
@@ -310,21 +313,29 @@ def build_restricted_globals(output_buffer):
             return ops[op]()
         raise ValueError(f"Unsupported operator: {op}")
 
+    def _unpack_sequence_(sequence, expected_length, *args):
+        sequence = list(sequence)
+        return sequence
+
     def safe_print(*args, **kwargs):
         output_buffer.append(" ".join(map(str, args)))
+
+    restricted_builtins = safe_builtins.copy()
+    restricted_builtins["print"] = safe_print
 
     return {
         "__name__": "__main__",
         "__doc__": None,
         "__package__": None,
         "__metaclass__": type,
-        "__builtins__": safe_builtins,
+        "__builtins__": restricted_builtins,
 
         "_write_": _write_,
         "_getiter_": _getiter_,
         "_getitem_": _getitem_,
         "_inplacevar_": _inplacevar_,
         "_iter_unpack_sequence_": guarded_iter_unpack_sequence,
+        "_unpack_sequence_": _unpack_sequence_,
 
         "list": list, "dict": dict, "set": set, "tuple": tuple,
         "len": len, "range": range, "enumerate": enumerate,
@@ -339,14 +350,14 @@ def build_restricted_globals(output_buffer):
     }
 
 
-# -------------------------------
-# Core Logic
-# -------------------------------
 def analyze_and_execute(code):
 
     execution_log = []
     previous_state = {}
     output_buffer = []
+
+    # Rewrite augmented subscript assignments before restricted compilation
+    code = rewrite_augmented_subscript(code)
 
     try:
         tree = ast.parse(code)
@@ -398,9 +409,6 @@ def analyze_and_execute(code):
     }
 
 
-# -------------------------------
-# API
-# -------------------------------
 @app.post("/run-code")
 def run_code(request: CodeRequest):
     return analyze_and_execute(request.code)
