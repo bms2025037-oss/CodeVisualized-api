@@ -229,52 +229,55 @@ def detect_visual_type(var_name, value, usage_map):
 def make_tracer(execution_log, previous_state, user_code, usage_map):
     total_lines = len(user_code.splitlines())
 
-    def trace(frame, event, arg):
-        if event == "line":
-            current_line = frame.f_lineno
+    def log_current_state(frame, current_line):
+        current_vars = frame.f_locals.copy()
 
-            if current_line > total_lines:
-                return trace
+        for var, value in current_vars.items():
+            if not is_valid_variable(var):
+                continue
 
-            if frame.f_code.co_filename != "<user_code>":
-                return trace
+            if is_data_structure(value):
+                current_snap = make_snapshot(value)
+                prev_snap = previous_state.get(var)
 
-            current_vars = frame.f_locals.copy()
-
-            for var, value in current_vars.items():
-                if not is_valid_variable(var):
+                if var not in previous_state:
+                    previous_state[var] = current_snap
+                    execution_log.append({
+                        "line": current_line,
+                        "variable": var,
+                        "python_type": normalize_python_type(value),
+                        "visual_type": detect_visual_type(var, value, usage_map),
+                        "value": copy.deepcopy(serialize_value(value))
+                    })
                     continue
 
-                if is_data_structure(value):
-                    current_snap = make_snapshot(value)
-                    prev_snap = previous_state.get(var)
+                if prev_snap != current_snap:
+                    execution_log.append({
+                        "line": current_line,
+                        "variable": var,
+                        "python_type": normalize_python_type(value),
+                        "visual_type": detect_visual_type(var, value, usage_map),
+                        "value": copy.deepcopy(serialize_value(value))
+                    })
+                    previous_state[var] = current_snap
 
-                    if var not in previous_state:
-                        previous_state[var] = current_snap
-                        execution_log.append({
-                            "line": current_line,
-                            "variable": var,
-                            "python_type": normalize_python_type(value),
-                            "visual_type": detect_visual_type(var, value, usage_map),
-                            "value": copy.deepcopy(serialize_value(value))
-                        })
-                        continue
+    def trace(frame, event, arg):
+        if frame.f_code.co_filename != "<user_code>":
+            return trace
 
-                    if prev_snap != current_snap:
-                        execution_log.append({
-                            "line": current_line,
-                            "variable": var,
-                            "python_type": normalize_python_type(value),
-                            "visual_type": detect_visual_type(var, value, usage_map),
-                            "value": copy.deepcopy(serialize_value(value))
-                        })
+        if event == "line":
+            current_line = frame.f_lineno
+            if current_line <= total_lines:
+                log_current_state(frame, current_line)
 
-                        previous_state[var] = current_snap
+        elif event == "return":
+            current_line = frame.f_lineno
+            if current_line <= total_lines:
+                log_current_state(frame, current_line)
 
         return trace
 
     return trace
-
 
 # -------------------------------
 # Restricted Globals
